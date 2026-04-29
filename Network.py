@@ -5,15 +5,23 @@ import math
 import torch
 import torch.nn as nn
 from torch import Tensor
+
 from timm.models.layers import trunc_normal_
 from ELICUtilis.layers import (
     AttentionBlock,
     conv3x3,
     CheckboardMaskedConv2d,
 )
+# Import saliency mask logic
+import sys
+import os
+pipeline_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if pipeline_root not in sys.path:
+    sys.path.insert(0, pipeline_root)
+from saliency_mask import SaliencyMask
 
-from compressai.models.priors import CompressionModel, GaussianConditional
-from compressai.ops import ste_round
+from compressai.models.google import CompressionModel, GaussianConditional
+
 from compressai.models.utils import conv, deconv, update_registered_buffers
 
 from ptflops import get_model_complexity_info
@@ -71,20 +79,22 @@ class Quantizer():
         else:
             return torch.round(inputs)
 
-class TestModel(CompressionModel):
 
-    def __init__(self, N=192, M=320, num_slices=5, **kwargs):
-        super().__init__(entropy_bottleneck_channels=192)
+class TestModel(CompressionModel):
+    def __init__(self, N=192, M=192, K=48, num_slices=5, **kwargs):
+        super().__init__(entropy_bottleneck_channels=M)
         self.N = int(N)
         self.M = int(M)
+        self.K = int(K)
         self.num_slices = num_slices
+        self.saliency_mask = SaliencyMask(K=self.K, alpha=1.0, latent_downsample=16)
 
         """
              N: channel number of main network
              M: channnel number of latent space
              
         """
-        self.groups = [0, 16, 16, 32, 64, 192] #support depth
+        self.groups = [0, 16, 16, 32, 64, 64] # support depth for M=192
         self.g_a = nn.Sequential(
             conv(3, N),
             ResidualBottleneckBlock(N),
@@ -139,31 +149,42 @@ class TestModel(CompressionModel):
 
         self.cc_transforms = nn.ModuleList(
             nn.Sequential(
-                conv(self.groups[min(1, i) if i > 0 else 0] + self.groups[i if i > 1 else 0], 224, stride=1,
+                conv(self.groups[min(1, i) if i > 0 else 0] + self.groups[i if i > 1 else 0], 112, stride=1,
                      kernel_size=5),
                 nn.ReLU(inplace=True),
-                conv(224, 128, stride=1, kernel_size=5),
+                conv(112, 64, stride=1, kernel_size=5),
                 nn.ReLU(inplace=True),
-                conv(128, self.groups[i + 1]*2, stride=1, kernel_size=5),
+                conv(64, self.groups[i + 1]*2, stride=1, kernel_size=5),
             ) for i in range(1,  num_slices)
-        ) ## from https://github.com/tensorflow/compression/blob/master/models/ms2020.py
+        ) ## adjusted for M=192
 
         self.context_prediction = nn.ModuleList(
             CheckboardMaskedConv2d(
             self.groups[i+1], 2*self.groups[i+1], kernel_size=5, padding=2, stride=1
             ) for i in range(num_slices)
-        )## from https://github.com/JiangWeibeta/Checkerboard-Context-Model-for-Efficient-Learned-Image-Compression/blob/main/version2/layers/CheckerboardContext.py
+        )## unchanged, as it depends on self.groups
 
+        # Calculate correct input channels for ParamAggregation at each slice
+        param_agg_in_channels = []
+        for i in range(self.num_slices):
+            ctx = 2 * self.groups[i+1]
+            if i == 0:
+                # support = [latent_means, latent_scales] = 2*M
+                support = 2 * self.M
+            else:
+                # support = [support_slices_ch_mean, support_slices_ch_scale, latent_means, latent_scales]
+                # support_slices_ch_mean/scale: self.groups[i+1] each
+                support = 2 * self.groups[i+1] + 2 * self.M
+            param_agg_in_channels.append(ctx + support)
         self.ParamAggregation = nn.ModuleList(
             nn.Sequential(
-                conv1x1(640 + self.groups[i+1 if i > 0 else 0] * 2 + self.groups[
-                        i + 1] * 2, 640),
+                conv1x1(param_agg_in_channels[i], 256),
                 nn.ReLU(inplace=True),
-                conv1x1(640, 512),
+                conv1x1(256, 128),
                 nn.ReLU(inplace=True),
-                conv1x1(512, self.groups[i + 1]*2),
-            ) for i in range(num_slices)
-        ) ##from checkboard "Checkerboard Context Model for Efficient Learned Image Compression"" gep网络参数
+                conv1x1(128, self.groups[i + 1]*2),
+            ) for i in range(self.num_slices)
+        ) ## fixed for M=192
 
         self.quantizer = Quantizer()
 
@@ -193,7 +214,7 @@ class TestModel(CompressionModel):
                 nn.init.constant_(m.weight, 1.0)
 
 
-    def forward(self, x, noise=False,  stage=3, s=1):
+    def forward(self, x, noise=False, stage=3, s=1, sal_map=None):
         if stage > 1:
             if s != 0:
                 QuantizationRegulator = torch.max(self.Gain[s], torch.tensor(1e-4)) + eps
@@ -206,6 +227,8 @@ class TestModel(CompressionModel):
         ReQuantizationRegulator = 1.0 / QuantizationRegulator.clone().detach()
 
         y = self.g_a(x)
+        # Apply saliency mask if sal_map is provided
+        y = self.saliency_mask(y, sal_map)
         B, C, H, W = y.size() ## The shape of y to generate the mask
 
         z = self.h_a(y)
@@ -213,7 +236,7 @@ class TestModel(CompressionModel):
         if not noise:
             z_offset = self.entropy_bottleneck._get_medians()
             z_tmp = z - z_offset
-            z_hat = ste_round(z_tmp) + z_offset
+            z_hat = torch.round(z_tmp) + z_offset  # STE: straight-through estimator
 
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
 
@@ -356,7 +379,7 @@ class TestModel(CompressionModel):
         net.load_state_dict(state_dict)
         return net
 
-    def compress(self, x, s, inputscale=0):
+    def compress(self, x, s, inputscale=0, sal_map=None):
         if inputscale != 0:
             QuantizationRegulator = inputscale
         else:
@@ -368,6 +391,8 @@ class TestModel(CompressionModel):
         import time
         y_enc_start = time.time()
         y = self.g_a(x)
+        # Apply saliency mask if sal_map is provided
+        y = self.saliency_mask(y, sal_map)
         y_enc = time.time() - y_enc_start
         B, C, H, W = y.size()  ## The shape of y to generate the mask
 
