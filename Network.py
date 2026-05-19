@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 from ELICUtilis.layers import (
     AttentionBlock,
     conv3x3,
