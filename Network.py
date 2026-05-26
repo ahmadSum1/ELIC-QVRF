@@ -81,12 +81,15 @@ class Quantizer():
 
 
 class TestModel(CompressionModel):
-    def __init__(self, N=192, M=192, K=48, num_slices=5, **kwargs):
+    def __init__(self, N=192, M=192, K=48, num_slices=5, ste_on_z=True, **kwargs):
         super().__init__(entropy_bottleneck_channels=M)
         self.N = int(N)
         self.M = int(M)
         self.K = int(K)
         self.num_slices = num_slices
+        # ste_on_z=False keeps noise quantization on z even in stage 3,
+        # preventing hyperprior collapse (sub-unit z snapped to median via STE)
+        self.ste_on_z = ste_on_z
         self.saliency_mask = SaliencyMask(K=self.K, alpha=1.0, latent_downsample=16)
 
         """
@@ -233,7 +236,7 @@ class TestModel(CompressionModel):
 
         z = self.h_a(y)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
-        if not noise:
+        if not noise and self.ste_on_z:
             z_offset = self.entropy_bottleneck._get_medians()
             z_tmp = z - z_offset
             z_hat = torch.round(z_tmp) + z_offset  # STE: straight-through estimator
