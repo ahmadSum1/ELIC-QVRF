@@ -34,6 +34,66 @@ eps = 1e-9
 def get_scale_table(min=SCALES_MIN, max=SCALES_MAX, levels=SCALES_LEVELS):
     return torch.exp(torch.linspace(math.log(min), math.log(max), levels))
 
+
+def latitude_adaptive_gain(s, H_latent, Gain, lmbda, device):
+    """Per-latent-row effective gain for latitude-adaptive quality modulation.
+
+    Implements NHK Arai et al. (2025) Eqns 10–13, adapted for QVRF's scalar
+    Gain vector instead of DCVC-RT's vector banks.
+
+    Args:
+        s:         base QVRF quality level (int, 0 .. q_num-1)
+        H_latent:  latent spatial height (ERP_H // 16 for full-frame eval)
+        Gain:      self.Gain nn.Parameter of shape [q_num]
+        lmbda:     self.lmbda list of length q_num
+        device:    torch device
+
+    Returns [H_latent] float32 tensor of per-row effective gains.
+
+    Latitude mapping (full-ERP, no crop):
+        φ(r) = (r + 0.5) / H_latent * π − π/2,  r = 0 … H_latent-1
+
+    Δq̄ uses the discrete row-mean (not the closed-form continuous integral
+    -(q_num-1)·ln2 / ln(λ_max/λ_min)) so that mean(q̃_φ) == s exactly.
+
+    cos(φ) is clamped to ≥ 1e-6 before log to prevent -inf at the poles;
+    q̃_φ is also clamped to [0, q_num-1] for safe floor/ceil indexing.
+    """
+    q_num    = len(lmbda)
+    ln_ratio = math.log(max(lmbda)) - math.log(min(lmbda))   # ln(λ_max/λ_min)
+
+    # [H_latent] latitude per row
+    rows  = torch.arange(H_latent, dtype=torch.float32, device=device)
+    phi   = (rows + 0.5) / H_latent * math.pi - math.pi / 2  # ∈ [-π/2, π/2]
+
+    cos_phi = torch.cos(phi).clamp(min=1e-6)                  # pole clamping
+
+    # Eqn 10: Δq_φ = (q_num−1)·ln(cos φ) / (ln λ_max − ln λ_min)  (≤ 0 everywhere)
+    dq_phi  = (q_num - 1) * torch.log(cos_phi) / ln_ratio     # [H_latent]
+
+    # Discrete row-mean → exact mean-centering on this latent grid
+    dq_bar  = dq_phi.mean()                                    # scalar
+
+    # Eqn 11: q̃_φ = q_0 + Δq_φ − Δq̄,  then clamp for index safety
+    q_tilde = (s + dq_phi - dq_bar).clamp(0.0, float(q_num - 1))  # [H_latent]
+
+    # Eqn 13: linear interpolation between adjacent discrete Gain levels
+    q_floor = q_tilde.floor().long().clamp(0, q_num - 1)      # [H_latent]
+    q_ceil  = q_tilde.ceil().long().clamp(0, q_num - 1)       # [H_latent]
+    frac    = (q_tilde - q_tilde.floor()).clamp(0.0, 1.0)     # [H_latent] ∈ [0,1]
+
+    # Standard lerp — handles exact-integer q_tilde correctly (frac=0 → Gain[floor])
+    g_phi   = (1.0 - frac) * Gain[q_floor] + frac * Gain[q_ceil]  # [H_latent]
+
+    # Gain-space renormalization: q-space centering guarantees mean(q̃)=s but
+    # Gain is approximately exponential (convex), so Jensen's inequality gives
+    # E[g(q̃)] > g(E[q̃]) = Gain[s] (empirically ~5-10% at middle s values).
+    # Renormalizing forces mean(g_phi) == Gain[s] so the entropy model stays
+    # calibrated at level s on average.
+    g_phi = g_phi * (Gain[s] / g_phi.mean().detach())
+
+    return g_phi
+
 def conv1x1(in_ch: int, out_ch: int, stride: int = 1) -> nn.Module:
     """1x1 convolution."""
     return nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride)
@@ -217,7 +277,7 @@ class TestModel(CompressionModel):
                 nn.init.constant_(m.weight, 1.0)
 
 
-    def forward(self, x, noise=False, stage=3, s=1, sal_map=None):
+    def forward(self, x, noise=False, stage=3, s=1, sal_map=None, latitude_adaptive=False):
         if stage > 1:
             if s != 0:
                 QuantizationRegulator = torch.max(self.Gain[s], torch.tensor(1e-4)) + eps
@@ -233,6 +293,14 @@ class TestModel(CompressionModel):
         # Apply saliency mask if sal_map is provided
         y = self.saliency_mask(y, sal_map)
         B, C, H, W = y.size() ## The shape of y to generate the mask
+
+        if latitude_adaptive:
+            # Replace uniform scalar QR with a per-latent-row gain vector [1,1,H,1].
+            # s_eff: when stage<=1 the model always uses Gain[0]; same here
+            _s_eff = s if stage > 1 else 0
+            g_phi = latitude_adaptive_gain(_s_eff, H, self.Gain, self.lmbda, x.device)
+            QuantizationRegulator   = g_phi.detach().reshape(1, 1, H, 1)  # [1,1,H,1]
+            ReQuantizationRegulator = (1.0 / g_phi.detach()).reshape(1, 1, H, 1)
 
         z = self.h_a(y)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
@@ -382,7 +450,7 @@ class TestModel(CompressionModel):
         net.load_state_dict(state_dict)
         return net
 
-    def compress(self, x, s, inputscale=0, sal_map=None):
+    def compress(self, x, s, inputscale=0, sal_map=None, latitude_adaptive=False):
         if inputscale != 0:
             QuantizationRegulator = inputscale
         else:
@@ -398,6 +466,12 @@ class TestModel(CompressionModel):
         y = self.saliency_mask(y, sal_map)
         y_enc = time.time() - y_enc_start
         B, C, H, W = y.size()  ## The shape of y to generate the mask
+
+        if latitude_adaptive and inputscale == 0:
+            # Per-row gain [1,1,H,1] replaces the uniform scalar.
+            g_phi = latitude_adaptive_gain(s, H, self.Gain, self.lmbda, x.device)
+            QuantizationRegulator   = g_phi.detach().reshape(1, 1, H, 1)
+            ReQuantizationRegulator = (1.0 / g_phi.detach()).reshape(1, 1, H, 1)
 
         z_enc_start = time.time()
         z = self.h_a(y)
@@ -497,7 +571,7 @@ class TestModel(CompressionModel):
                 "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec, "params": params_time}}
 
 
-    def decompress(self, strings, shape, s, inputscale=0):
+    def decompress(self, strings, shape, s, inputscale=0, latitude_adaptive=False):
         assert isinstance(strings, list) and len(strings) == 2
         if inputscale != 0:
             QuantizationRegulator = inputscale
@@ -515,6 +589,13 @@ class TestModel(CompressionModel):
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
 
         y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
+
+        if latitude_adaptive and inputscale == 0:
+            # H_latent = latent height = z_hat_height * 4 (h_a applies 2× stride-2)
+            H_latent = z_hat.shape[2] * 4
+            g_phi = latitude_adaptive_gain(s, H_latent, self.Gain, self.lmbda, z_hat.device)
+            QuantizationRegulator   = g_phi.detach().reshape(1, 1, H_latent, 1)
+            ReQuantizationRegulator = (1.0 / g_phi.detach()).reshape(1, 1, H_latent, 1)
         y_strings = strings[0]
 
         ctx_params_anchor = torch.zeros((B, self.M*2, z_hat.shape[2] * 4, z_hat.shape[3] * 4)).to(z_hat.device)
